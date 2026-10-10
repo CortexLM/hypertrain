@@ -29,6 +29,7 @@ PY
   test "$(jq -r '.Labels["io.cortex.challenge.source-manifest"]' <<<"$config")" = "$(sha256sum "$manifest" | cut -d ' ' -f 1)"
   test "$(jq -c '.Entrypoint' <<<"$config")" = '["hypertrain-miner"]'
   "$engine" run --rm -i --network=none --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
     -e PYTHONDONTWRITEBYTECODE=1 -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 \
     -v "$(realpath "$manifest"):/candidate-source.json:ro" \
     --entrypoint /opt/hypertrain/venv/bin/python "$image" - <<'PY'
