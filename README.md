@@ -74,7 +74,7 @@ flowchart LR
     C --> X["Cortex"]
 ```
 
-Regions hold several islands each, and the diagram collapses them into one node. An island is one machine or a cluster of GPUs in one datacenter, and it trains on its own. Updates from nearby islands are combined by a regional relay first, so the long-distance links only carry a few merged updates. The challenge service keeps the round state and the ledger, auditors replay work, and Cortex reads the final weights from it each epoch.
+Regions hold several islands each, and the diagram collapses them into one node. An island is one machine or a cluster of GPUs in one datacenter, and it trains on its own. Regional relays transport and cache each island's original update; the central deterministic aggregator merges them. The challenge service keeps the round state and the ledger, auditors replay work, and Cortex reads the final weights from it each epoch.
 
 ### 3. When rewards are paid
 
@@ -101,6 +101,14 @@ Nothing is paid the moment work is submitted. A round is final only after its au
 - **Money at risk.** Escrow, vesting and burning make cheating cost more than it can earn. No miner ever reports its own score.
 
 ## Results so far
+
+### Network v2: scoped evidence, three tasks still open
+
+Attempt008 FIRST4 passed same-driver two-host bitwise CUDA qualification: four rounds, eight rank workers, a 61,856-parameter decoder, both hosts on driver580.95.05. This does not qualify cross-driver execution, quality parity or funded116 continuation. Public miner CLI evidence is separate in-process CPU execution, not installed-CLI subprocess or CUDA proof.
+
+Local Kubernetes r2 passed import/source109, TLS/CNI, full upload to the fixture master, restart/replica replay, regional fallback, retention/GC and namespace denial, with verified owned cleanup. Its outer caller still exited1 on READY-before-ownership; an isolated caller phase correction subsequently passed two native-event regression cases, without rewriting that historical failure. The shipped gateway namespace AND pod TCP8443 policy passed one regression rendering all four Kustomize overlays. APAC runtime, L0 finality, full D3, funded116 and roster/service capacity remain unproven; the root ledger is20/23, not network completion. Three tasks remain: allocation80, CPU verification and final push/CI. Operator, consumer, wrapper and antiabuse contracts are complete within their verified CPU scope. Capacity controller safeguards were previously reviewed; current source requalification is pending after type/runtime changes. Genuine80 H2 execution remains unrun; fresh CPU approval is absent and root execution admission remains pending.
+
+Exact independent evidence and scope limits: [Network v2 current proof boundary](docs/network-v2.md#current-proof-boundary) and [current network results](docs/RESULTS.md#current-network-v2-update---2026-10-10).
 
 ### GPU determinism, Phase A: PASS
 
@@ -228,10 +236,10 @@ What is enforced:
 
 What isn't done yet, honestly:
 
-- **Single GPU miner client.** `hypertrain-miner` currently enforces one GPU per island. The multi-rank island layout exists in `trainer/island.py` and is tested on CPU, but the client doesn't launch it yet.
+- **Multi-rank evidence is scoped.** Network v2 public CLI multi-rank execution is verified in-process on CPU, not as an installed-CLI subprocess or current CUDA admission. Historical FIRST4 CUDA008 qualification is separate.
 - **Joining is manual.** Contract v1 has no public join route. `hypertrain-miner join` prints a signed admission request (with a hardware self-check) that the operator adds to the roster.
-- **Dispute bisection in the miner is step level only.** The auditor side bisects down to layer and operation; the miner client takes part at step level and doesn't poll open disputes on its own.
-- **GPU determinism is proven for one setup.** Phase A covers single RTX 5090 hosts with a pinned image. Multi-GPU hosts (Phase B) passed on two hosts; see the Phase B note above. The hardware self-check has only run on CPU.
+- **Dispute watch evidence is scoped.** Network v2 public CLI watch performs one operator-invoked bounded polling pass. CPU evidence covers STEP-to-LAYER signed reply/acknowledgment over actual FastAPI and verified TLS, with durable cursor/outbox retries. Published STEP/LAYER/OP traces are supported; installed-binary, current CUDA and full referee execution remain separate.
+- **GPU qualification is scoped.** Historical Phase A/B and network-v2 FIRST4 attempt008 retain their separate model/image/driver scopes; see the results above. Public CLI CPU evidence does not establish current production CUDA admission.
 - **Quality parity is unproven.** No parity claim is made until the pending CPU and GPU work reports.
 - **One run per state directory** in the challenge service.
 - **The publish secret scan is a heuristic.** `scripts/publish.sh` skips digit-free values of 20+ characters under a credential parent. It does not guarantee a clean tree, so the out-of-band token approval and a manual review stay mandatory.

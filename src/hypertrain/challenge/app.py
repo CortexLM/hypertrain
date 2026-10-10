@@ -16,13 +16,26 @@ from typing import Annotated, Any
 import httpx
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+)
 
 from hypertrain.beacon import BeaconRound, parse_round
+from hypertrain.challenge.admission_store import AdmissionError
+from hypertrain.challenge.disputes_v2 import DisputeError, EventAck
 from hypertrain.challenge.store import ChallengeError, ChallengeStore
 from hypertrain.data.store import LocalFSStore
 from hypertrain.data.store import Store as ObjectStore
 from hypertrain.ledger import Params, vest_rounds_for_q
+from hypertrain.ledger.escrow_v2 import EscrowError
+from hypertrain.protocol.envelope import EnvelopeError
+from hypertrain.protocol.envelope_v2 import load_json
+from hypertrain.protocol.jcs import canonicalize
 from hypertrain.protocol.keys import KeyError_, Keypair, decode_hotkey
 from hypertrain.protocol.messages import QUICKNET_GENESIS
 from hypertrain.public_api import create_public_app
@@ -167,7 +180,8 @@ def _require(path: Path | None, authorization: str | None) -> None:
         raise ChallengeError(401, "unauthorized")
     presented = authorization.removeprefix("Bearer ").strip()
     if not hmac.compare_digest(
-        hashlib.sha256(presented.encode()).digest(), hashlib.sha256(expected.encode()).digest()
+        hashlib.sha256(presented.encode()).digest(),
+        hashlib.sha256(expected.encode()).digest(),
     ):
         raise ChallengeError(401, "unauthorized")
 
@@ -257,15 +271,33 @@ def create_app(
     transport: httpx.AsyncBaseTransport | None = None,
     verify_beacon: Callable[[Mapping[str, Any]], BeaconRound] = parse_round,
     objects: ObjectStore | None = None,
+    _store: ChallengeStore | None = None,
 ) -> FastAPI:
-    store = ChallengeStore(
-        config.state_dir,
-        config.params,
-        load_coord_key(config.coord_key_file),
-        config.owner_hotkey,
-        verify_beacon,
-        objects or LocalFSStore(config.state_dir / "objects"),
+    if _store is not None and (
+        _store.state_dir.resolve() != config.state_dir.resolve()
+        or _store.owner_hotkey != config.owner_hotkey
+        or _store.params != config.params
+        or _store.coord is None
+        or config.coord_key_file is None
+        or (configured_coord := load_coord_key(config.coord_key_file)) is None
+        or _store.coord.ss58 != configured_coord.ss58
+        or objects is not None
+        and _store.objects is not objects
+    ):
+        raise ValueError("trusted continuation store/config differs")
+    store = (
+        _store
+        if _store is not None
+        else ChallengeStore(
+            config.state_dir,
+            config.params,
+            load_coord_key(config.coord_key_file),
+            config.owner_hotkey,
+            verify_beacon,
+            objects or LocalFSStore(config.state_dir / "objects"),
+        )
     )
+    store.clock = clock
     client = httpx.AsyncClient(transport=transport)
     metagraph = Metagraph(config.master_url, client)
     app = FastAPI(
@@ -276,6 +308,373 @@ def create_app(
         openapi_url=None,
     )
     app.state.store = store
+
+    @app.on_event("shutdown")
+    def close_notifications() -> None:
+        store.close_v2_notifications()
+
+    async def v2_raw(request: Request) -> bytes:
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > BODY_MAX + 1024:
+                raise ChallengeError(413, "v2 body exceeds limit")
+        load_json(bytes(data), max_bytes=BODY_MAX + 1024)
+        return bytes(data)
+
+    async def v2_error(_: Request, error: Exception) -> JSONResponse:
+        return JSONResponse({"detail": str(error)}, status_code=409)
+
+    for cls in (
+        AdmissionError,
+        DisputeError,
+        EscrowError,
+        EnvelopeError,
+        ValidationError,
+    ):
+        app.add_exception_handler(cls, v2_error)
+
+    @app.post("/v2/admin/runs", status_code=201)
+    async def create_v2(request: Request, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.create_run_v2, await v2_raw(request))
+
+    @app.get("/v2/runs/{run_id}")
+    async def status_v2(run_id: str) -> Any:
+        return await run(store.run_status_v2, run_id)
+
+    @app.post("/v2/runs/{run_id}/join")
+    async def join_v2(run_id: str, request: Request) -> Any:
+        import ipaddress
+
+        address = request.client.host if request.client else "127.0.0.1"
+        try:
+            ip = ipaddress.ip_address(address)
+            prefix = str(
+                ipaddress.ip_network(f"{ip}/{24 if ip.version == 4 else 64}", strict=False)
+            )
+        except ValueError:
+            prefix = "local-transport"
+        return await run(store.admission_v2, run_id, "join", await v2_raw(request), "", prefix)
+
+    @app.get("/v2/runs/{run_id}/join/{admission_id}/challenge")
+    async def challenge_v2(run_id: str, admission_id: str) -> Any:
+        return await run(store.admission_v2, run_id, "challenge", b"", admission_id)
+
+    @app.get("/v2/runs/{run_id}/admission/{hotkey}")
+    async def admission_status_v2(run_id: str, hotkey: str) -> Any:
+        return await run(store.admission_v2, run_id, "status", b"", hotkey)
+
+    @app.post("/v2/runs/{run_id}/join/proof")
+    async def proof_v2(run_id: str, request: Request) -> Any:
+        data = load_json(await v2_raw(request))
+        if not isinstance(data, dict) or set(data) != {"proof", "screen"}:
+            raise ChallengeError(422, "expected original signed proof and screen")
+        return await run(
+            store.trial_proof_v2,
+            run_id,
+            canonicalize(data["proof"]),
+            canonicalize(data["screen"]),
+        )
+
+    @app.post("/v2/runs/{run_id}/admin/join/{admission_id}/reference")
+    async def reference_v2(run_id: str, admission_id: str, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.trial_reference_v2, run_id, admission_id)
+
+    @app.post("/v2/runs/{run_id}/admin/join/{admission_id}/finalize")
+    async def trial_final_v2(
+        run_id: str, admission_id: str, request: Request, authorization: Auth = None
+    ) -> Any:
+        admin(authorization)
+        return await run(store.trial_finalize_v2, run_id, admission_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admin/join/{admission_id}/shadow-reservation")
+    async def shadow_reservation_v2(
+        run_id: str, admission_id: str, request: Request, authorization: Auth = None
+    ) -> Any:
+        admin(authorization)
+        return await run(store.shadow_reservation_v2, run_id, admission_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admin/join/{admission_id}/shadow-reward")
+    async def shadow_reward_v2(
+        run_id: str, admission_id: str, request: Request, authorization: Auth = None
+    ) -> Any:
+        admin(authorization)
+        return await run(store.shadow_reward_v2, run_id, admission_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admission/{hotkey}/rotate")
+    async def rotate_v2(run_id: str, hotkey: str, request: Request) -> Any:
+        raw = await v2_raw(request)
+        from hypertrain.protocol.envelope_v2 import parse_envelope
+
+        if parse_envelope(raw).body.get("hotkey") != hotkey:
+            raise ChallengeError(422, "rotation path and body differ")
+        return await run(store.admission_v2, run_id, "rotate", raw)
+
+    def v2_operation(path: str, action: str) -> None:
+        async def handler(run_id: str, request: Request) -> Any:
+            return await run(store.admission_v2, run_id, action, await v2_raw(request))
+
+        app.post("/v2/runs/{run_id}/" + path, name="v2_" + action)(handler)
+
+    for path, action in (
+        ("escrow/lock", "lock"),
+        ("escrow/transfer", "transfer"),
+        ("escrow/release", "release"),
+        ("dispute", "dispute"),
+        ("bisect", "bisect"),
+        ("resolution", "resolution"),
+        ("state-serve", "state-serve"),
+        ("admission/recover", "recover"),
+    ):
+        v2_operation(path, action)
+
+    @app.put("/v2/runs/{run_id}/admin/dataset")
+    async def dataset_v2(run_id: str, request: Request, authorization: Auth = None) -> Any:
+        admin(authorization)
+        data = load_json(await v2_raw(request))
+        if not isinstance(data, dict):
+            raise ChallengeError(422, "expected dataset object linkage")
+        return await run(store.configure_inputs_v2, run_id, data)
+
+    @app.post("/v2/runs/{run_id}/admin/genesis")
+    async def genesis_v2(run_id: str, request: Request, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.genesis_v2, run_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admin/rounds")
+    async def open_v2(run_id: str, request: Request, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.open_round_v2, run_id, await v2_raw(request))
+
+    @app.put("/v2/runs/{run_id}/objects/{sha256}")
+    async def put_object_v2(
+        run_id: str,
+        sha256: str,
+        request: Request,
+        x_hotkey: Annotated[str, Header()],
+        x_object_signature: Annotated[str, Header()],
+    ) -> Any:
+        from hypertrain.protocol.keys import verify
+
+        with store._lock:
+            store._run_v2(run_id)
+            store._owner_v2(run_id, x_hotkey)
+        try:
+            valid = verify(
+                decode_hotkey(x_hotkey),
+                f"hypertrain/object/2|{run_id}|{sha256}".encode(),
+                bytes.fromhex(x_object_signature),
+            )
+        except (ValueError, KeyError_):
+            valid = False
+        if not valid:
+            raise ChallengeError(403, "object signature mismatch")
+        # Admission objects are separately bounded by the pinned policy.
+        raw = bytearray()
+        limit = store._services(run_id)[1].policy.artifact_limits.max_object_bytes
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > limit:
+                raise ChallengeError(413, "object exceeds pinned admission limit")
+        if hashlib.sha256(raw).hexdigest() != sha256:
+            raise ChallengeError(422, "object hash differs")
+        key = await run(store.objects.put, bytes(raw))
+        return {"sha256": key}
+
+    @app.get("/v2/runs/{run_id}/rounds/{w}")
+    async def round_v2(run_id: str, w: int) -> Any:
+        return await run(store.round_view_v2, run_id, w)
+
+    @app.get("/v2/runs/{run_id}/rounds/{w}/job/{hotkey}")
+    async def job_v2(run_id: str, w: int, hotkey: str) -> Any:
+        return await run(store.island_job_v2, run_id, w, hotkey)
+
+    @app.get("/v2/runs/{run_id}/objects/{sha256}")
+    async def object_v2(run_id: str, sha256: str) -> Response:
+        store._run_v2(run_id)
+        # Published run datasets/state are public, content identity still verifies.
+        return Response(await run(store.objects.get, sha256), media_type="application/octet-stream")
+
+    for action in ("accept", "commit", "delta"):
+
+        def add_training(action: str) -> None:
+            async def handler(run_id: str, request: Request) -> Any:
+                return await run(store.training_v2, run_id, action, await v2_raw(request))
+
+            app.post("/v2/runs/{run_id}/" + action, name="v2_" + action)(handler)
+
+        add_training(action)
+
+    @app.post("/v2/runs/{run_id}/leaves")
+    async def leaves_v2(run_id: str, request: Request) -> Any:
+        return await run(store.leaves_v2, run_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admin/rounds/{w}/audits")
+    async def audits_v2(run_id: str, w: int, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return {"jobs": await run(store.schedule_audits_v2, run_id, w)}
+
+    @app.post("/v2/runs/{run_id}/worker/lease")
+    async def lease_v2(run_id: str, request: Request) -> Any:
+        job = await run(store.lease_v2, run_id, await v2_raw(request))
+        return Response(status_code=204) if job is None else job
+
+    @app.post("/v2/runs/{run_id}/worker/jobs/{job_id}/execute")
+    async def execute_v2(run_id: str, job_id: str, request: Request) -> Any:
+        return await run(store.execute_audit_v2, run_id, job_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/worker/jobs/{job_id}/complete")
+    async def complete_v2(run_id: str, job_id: str, request: Request) -> Any:
+        return await run(store.complete_audit_v2, run_id, job_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admin/rounds/{w}/aggregate")
+    async def aggregate_v2(run_id: str, w: int, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.aggregate_v2, run_id, w)
+
+    @app.post("/v2/runs/{run_id}/admin/rounds/{w}/finalize")
+    async def final_v2(run_id: str, w: int, request: Request, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.finalize_v2, run_id, w, await v2_raw(request))
+
+    @app.get("/v2/runs/{run_id}/rounds/{w}/relay/{hotkey}")
+    async def assignment_v2(run_id: str, w: int, hotkey: str) -> Any:
+        return await run(store.relay_assignment_v2, run_id, w, hotkey)
+
+    @app.post("/v2/runs/{run_id}/upload-grant")
+    async def grant_v2(run_id: str, request: Request, commit_hash: str | None = None) -> Any:
+        return await run(store.upload_grant_v2, run_id, await v2_raw(request), commit_hash)
+
+    @app.post("/v2/relay-receipts")
+    async def receipt_v2(request: Request) -> Any:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30) as transport:
+            return await store.relay_receipt_v2(await v2_raw(request), transport)
+
+    @app.get("/v2/runs/{run_id}/admin/relay-settlement/{grant_hash}")
+    async def relay_settlement_v2(run_id: str, grant_hash: str, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.relay_settlement_v2, run_id, grant_hash)
+
+    @app.post("/v2/runs/{run_id}/admin/disputes/{dispute_id}/state/{checkpoint}")
+    async def dispute_state_v2(
+        run_id: str, dispute_id: str, checkpoint: int, authorization: Auth = None
+    ) -> Any:
+        admin(authorization)
+        return await run(store.dispute_state_v2, run_id, dispute_id, checkpoint)
+
+    @app.post("/v2/runs/{run_id}/admin/rollback")
+    async def rollback_v2(run_id: str, request: Request, authorization: Auth = None) -> Any:
+        from hypertrain.aggregator.core import TapeError
+
+        admin(authorization)
+        try:
+            return await run(store.rollback_v2, run_id, await v2_raw(request))
+        except TapeError as error:
+            raise ChallengeError(409, str(error)) from error
+
+    @app.post("/v2/runs/{run_id}/admin/rollback-preview")
+    async def rollback_preview_v2(run_id: str, request: Request, authorization: Auth = None) -> Any:
+        from hypertrain.aggregator.core import TapeError
+
+        admin(authorization)
+        try:
+            return await run(store.rollback_preview_v2, run_id, await v2_raw(request))
+        except TapeError as error:
+            raise ChallengeError(409, str(error)) from error
+
+    @app.post("/v2/runs/{run_id}/admin/disputes/{dispute_id}/referee")
+    async def referee_v2(run_id: str, dispute_id: str, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.referee_v2, run_id, dispute_id)
+
+    @app.post("/v2/runs/{run_id}/admin/disputes/{dispute_id}/timeout")
+    async def timeout_v2(
+        run_id: str, dispute_id: str, request: Request, authorization: Auth = None
+    ) -> Any:
+        admin(authorization)
+        return await run(store.dispute_timeout_v2, run_id, dispute_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admin/relay-registry")
+    async def registry_v2(run_id: str, request: Request, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.rotate_registry_v2, run_id, await v2_raw(request))
+
+    @app.post("/v2/runs/{run_id}/admin/relay/{grant_hash}/{action}")
+    async def relay_control_v2(
+        run_id: str, grant_hash: str, action: str, authorization: Auth = None
+    ) -> Any:
+        admin(authorization)
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30) as client:
+            return await store.relay_control_v2(run_id, grant_hash, action, client)
+
+    @app.post("/v2/runs/{run_id}/admin/relay-failure")
+    async def failure_v2(run_id: str, request: Request, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.relay_failure_v2, run_id, await v2_raw(request))
+
+    @app.get("/v2/runs/{run_id}/relay-observers/{grant_hash}/{observer}")
+    async def observer_challenge_v2(run_id: str, grant_hash: str, observer: str) -> Any:
+        return await run(store.relay_observer_v2, run_id, grant_hash, observer)
+
+    @app.post("/v2/runs/{run_id}/relay-observers/{grant_hash}/{observer}")
+    async def observer_response_v2(
+        run_id: str, grant_hash: str, observer: str, request: Request
+    ) -> Any:
+        return await run(
+            store.relay_observer_v2, run_id, grant_hash, observer, await v2_raw(request)
+        )
+
+    @app.post("/v2/runs/{run_id}/admin/relay-fallback/{failure_hash}")
+    async def fallback_v2(run_id: str, failure_hash: str, authorization: Auth = None) -> Any:
+        admin(authorization)
+        async with httpx.AsyncClient(follow_redirects=False, timeout=30) as client:
+            return await store.relay_fallback_v2(run_id, failure_hash, client)
+
+    @app.post("/v2/runs/{run_id}/admin/relay-drain/{relay_id}")
+    async def drain_v2(run_id: str, relay_id: str, authorization: Auth = None) -> Any:
+        admin(authorization)
+        return await run(store.relay_drain_v2, run_id, relay_id)
+
+    @app.get("/v2/runs/{run_id}/disputes")
+    async def events_v2(
+        run_id: str,
+        party: str,
+        cursor: int = 0,
+        wait_seconds: Annotated[float, Query(alias="timeout")] = 0,
+        x_dispute_signature: Annotated[str | None, Header()] = None,
+    ) -> Any:
+        from hypertrain.protocol.keys import verify
+
+        if cursor < 0 or not 0 <= wait_seconds <= 30:
+            raise ChallengeError(422, "invalid event cursor or wait")
+        try:
+            valid = verify(
+                decode_hotkey(party),
+                f"hypertrain/watch/2|{run_id}|{party}".encode(),
+                bytes.fromhex(x_dispute_signature or ""),
+            )
+        except (ValueError, KeyError_):
+            valid = False
+        if not valid:
+            raise ChallengeError(403, "party event access requires signature")
+        _, _, disputes = await run(store._services, run_id)
+        events = await run(lambda: disputes.events(party, cursor, timeout=wait_seconds))
+        return [e.model_dump(mode="json") for e in events]
+
+    @app.post("/v2/runs/{run_id}/disputes/ack")
+    async def ack_v2(run_id: str, request: Request) -> Any:
+        ack = EventAck.model_validate(load_json(await v2_raw(request)))
+        _, _, disputes = await run(store._services, run_id)
+
+        def accepted_ack() -> None:
+            with store._tx():
+                store._snapshot_current_v2(store._run_v2(run_id))
+                disputes.acknowledge(ack, now=store._now(store._db))
+
+        await run(accepted_ack)
+        return {"accepted": ack.cursor}
 
     def run(function: Callable[..., Any], *args: Any) -> Awaitable[Any]:
         return asyncio.to_thread(function, *args)
@@ -520,7 +919,8 @@ def create_app(
     app.mount(
         "/public",
         create_public_app(
-            config.state_dir / "challenge.db", config.state_dir / "public" / "metrics.jsonl"
+            config.state_dir / "challenge.db",
+            config.state_dir / "public" / "metrics.jsonl",
         ),
     )
     return app
