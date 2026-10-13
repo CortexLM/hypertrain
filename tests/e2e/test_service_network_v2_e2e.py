@@ -39,6 +39,7 @@ def od_carry_network(tmp_path, request, monkeypatch):
     yield from fixtures.network.__wrapped__(tmp_path, request)
 
 
+@pytest.mark.od
 @pytest.mark.parametrize("od_carry_network", ["mlm", "decision", "distill"], indirect=True)
 def test_od_carry_admission_reference_requires_real_full_state(od_carry_network):
     """First production prerequisite: genuine corresponding-manifest graduation work."""
