@@ -305,8 +305,10 @@ if stage open; then
   done_
 fi
 if stage minerstart; then
-  mssh 'pgrep -f /opt/miner/loop.sh > /dev/null || { setsid nohup bash /opt/miner/loop.sh > /dev/null 2>&1 < /dev/null & }' \
+  # [/] keeps pgrep from matching the remote shell whose own argv contains the pattern.
+  mssh "pgrep -f '[/]opt/miner/loop.sh' > /dev/null || { setsid nohup bash /opt/miner/loop.sh > /dev/null 2>&1 < /dev/null & }" \
     || die "miner loop start"
+  mssh "sleep 2; pgrep -f '[/]opt/miner/loop.sh' > /dev/null" || die "miner loop is not running on $MINER_SSH"
   done_
 fi
 

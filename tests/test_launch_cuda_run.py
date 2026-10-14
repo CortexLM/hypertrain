@@ -1,11 +1,8 @@
 """launch_cuda_run.sh refuses without an explicit mode and fails closed in preflight."""
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
-
-import pytest
 
 SCRIPT = Path(__file__).parents[1] / "scripts/launch_cuda_run.sh"
 
@@ -22,7 +19,6 @@ def test_requires_explicit_mode(tmp_path: Path) -> None:
     assert result.returncode == 2 and "--dry-run | --yes-spend" in result.stderr
 
 
-@pytest.mark.skipif(shutil.which("setpriv") is None, reason="util-linux")
 def test_preflight_names_the_first_missing_input_and_spends_nothing(tmp_path: Path) -> None:
     result = _run(tmp_path, "--yes-spend")
     assert result.returncode == 1

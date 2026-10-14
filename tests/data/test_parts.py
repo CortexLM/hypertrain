@@ -216,26 +216,28 @@ def test_oversize_input_never_publishes_index(tmp_path: Path) -> None:
 def test_parallel_fetch_writes_parts_in_order_despite_out_of_order_completion(
     tmp_path: Path,
 ) -> None:
-    import random
     import threading
-    import time
 
-    # Given: a 9-part object whose GETs finish in random order on several threads.
+    # Given: a 9-part object; part 0 is only served once part 1 has been fetched, so a serial
+    # fetch would deadlock (bounded by the timeout) and in-order output needs real reordering.
     rec, data, index = _setup(tmp_path, 8 * PART_BYTES + 77)
     ref = hashlib.sha256(rec.puts[-1]).hexdigest()
-    threads: set[int] = set()
+    second_done = threading.Event()
 
     def get(sha: str) -> bytes:
-        threads.add(threading.get_ident())
-        time.sleep(random.random() / 200)
-        return rec.store.get(sha)
+        if sha == index.parts[0]:
+            assert second_done.wait(timeout=10), "parts were not fetched concurrently"
+        body = rec.store.get(sha)
+        if sha == index.parts[1]:
+            second_done.set()
+        return body
 
     out = tmp_path / "out"
     out.mkdir()
     # When: fetched with 4 workers.
     fetch_to(ref, get, out / "dest", workers=4)
-    # Then: byte-identical reassembly, really concurrent.
-    assert (out / "dest").read_bytes() == data and len(threads) > 1
+    # Then: byte-identical reassembly.
+    assert (out / "dest").read_bytes() == data
 
 
 def test_parallel_fetch_failing_part_leaves_no_temp_and_stops_queueing(tmp_path: Path) -> None:

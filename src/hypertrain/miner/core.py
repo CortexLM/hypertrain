@@ -65,7 +65,10 @@ def _retrying[T](what: str, fn: Callable[[], T]) -> T:
             status = getattr(error, "status", status)
             if delay is None or (status is not None and status < 500):
                 raise
-            log.warning("%s failed (%s); retry in %ss", what, error, delay)
+            # Type + status only: request URLs can carry the proxy token.
+            log.warning(
+                "%s failed (%s %s); retry in %ss", what, type(error).__name__, status, delay
+            )
             time.sleep(delay)
     raise AssertionError("unreachable")
 
