@@ -428,8 +428,43 @@ def run(config_path: Path) -> Result:
         durable_write(cfg.output / "custody.json", json.dumps(inventory, sort_keys=True).encode())
 
 
+# Host custody.json: flat {relative path: sha256}; 1 MiB holds thousands of entries.
+INVENTORY_BYTES = 1 << 20
+
+
+def inventory(data: bytes) -> dict[str, str]:
+    """Parse the driver's custody.json (written after every round file) at a trust boundary."""
+    if len(data) > INVENTORY_BYTES:
+        raise Reject("qualification_inventory_oversized")
+    try:
+        parsed = json.loads(data)
+    except ValueError as exc:
+        raise Reject("qualification_inventory_malformed") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) for v in parsed.values()
+    ):
+        raise Reject("qualification_inventory_malformed")
+    return parsed
+
+
+def host_inventory(result_path: Path) -> dict[str, str]:
+    """Bounded read of custody.json beside result.json; it must list this exact result."""
+    path = result_path.parent / "custody.json"
+    if path.is_symlink() or not path.is_file():
+        raise Reject("qualification_inventory_missing")
+    with path.open("rb") as file:
+        claimed = inventory(file.read(INVENTORY_BYTES + 1))
+    if claimed.get("result.json") != fsha(result_path):
+        raise Reject("qualification_inventory_unbound")
+    return claimed
+
+
 def compare(paths: list[Path], manifest: RunManifestV2) -> dict[str, bool]:
-    """Ranks/H/J/image come from the caller's validated manifest, never from a Result."""
+    """Ranks/H/J/image come from the caller's validated manifest, never from a Result.
+
+    Each round file is proven by rescued bytes when present, else by the host inventory
+    (hash-only rescue, verified against the controller's export hashes at rescue time).
+    """
     if len(paths) != 2:
         raise Reject("qualification_requires_two_host_results")
     a, b = [Result.model_validate_json(p.read_bytes()) for p in paths]
@@ -451,11 +486,18 @@ def compare(paths: list[Path], manifest: RunManifestV2) -> dict[str, bool]:
         raise Reject("qualification_two_host_binding_or_bitwise_mismatch")
     expected = set(round_files(ref.layout.n_gpus, inner.H, inner.J))
     for path, result in zip(paths, (a, b), strict=True):
+        claimed: dict[str, str] | None = None
         for index, files in enumerate(result.rounds):
             if set(files) != expected:
                 raise Reject("qualification_full_round_coverage_missing")
             for rel, want in files.items():
-                if fsha(confined(path.parent / f"round-{index}/published", rel)) != want:
+                published = path.parent / f"round-{index}/published"
+                if (published / rel).exists() or (published / rel).is_symlink():
+                    actual: str | None = fsha(confined(published, rel))
+                else:
+                    claimed = claimed if claimed is not None else host_inventory(path)
+                    actual = claimed.get(f"round-{index}/published/{rel}")
+                if actual != want:
                     raise Reject("qualification_artifact_custody_changed")
     return {"two_host_bitwise_match": True, "workload_allowed": False}
 
