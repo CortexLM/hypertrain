@@ -462,8 +462,9 @@ def host_inventory(result_path: Path) -> dict[str, str]:
 def compare(paths: list[Path], manifest: RunManifestV2) -> dict[str, bool]:
     """Ranks/H/J/image come from the caller's validated manifest, never from a Result.
 
-    Each round file is proven by rescued bytes when present, else by the host inventory
-    (hash-only rescue, verified against the controller's export hashes at rescue time).
+    A full rescue proves every round file by its rescued bytes. A hash-only rescue (no round
+    file rescued at all) proves them by the host inventory: host-computed hashes, bound to
+    result.json and cross-checked between the two hosts. A partial tree is never accepted.
     """
     if len(paths) != 2:
         raise Reject("qualification_requires_two_host_results")
@@ -486,17 +487,21 @@ def compare(paths: list[Path], manifest: RunManifestV2) -> dict[str, bool]:
         raise Reject("qualification_two_host_binding_or_bitwise_mismatch")
     expected = set(round_files(ref.layout.n_gpus, inner.H, inner.J))
     for path, result in zip(paths, (a, b), strict=True):
-        claimed: dict[str, str] | None = None
+        hash_only = not any(
+            p.is_file() or p.is_symlink() for p in path.parent.glob("round-*/published/**/*")
+        )
+        claimed = host_inventory(path) if hash_only else {}
         for index, files in enumerate(result.rounds):
             if set(files) != expected:
                 raise Reject("qualification_full_round_coverage_missing")
             for rel, want in files.items():
                 published = path.parent / f"round-{index}/published"
-                if (published / rel).exists() or (published / rel).is_symlink():
-                    actual: str | None = fsha(confined(published, rel))
-                else:
-                    claimed = claimed if claimed is not None else host_inventory(path)
+                if hash_only:
                     actual = claimed.get(f"round-{index}/published/{rel}")
+                elif (published / rel).exists() or (published / rel).is_symlink():
+                    actual = fsha(confined(published, rel))
+                else:
+                    actual = None
                 if actual != want:
                     raise Reject("qualification_artifact_custody_changed")
     return {"two_host_bitwise_match": True, "workload_allowed": False}

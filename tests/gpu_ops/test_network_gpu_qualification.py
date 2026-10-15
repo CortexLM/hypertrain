@@ -144,7 +144,18 @@ def test_hash_only_rescue_compares_from_bound_host_inventories(tmp_path: Path) -
     result = driver.compare(paths, manifest())
     # Then
     assert result == {"two_host_bitwise_match": True, "workload_allowed": False}
-    assert not [p for p in paths[0].parent.glob("round-*/published/**/*") if p.is_file()]
+
+
+def test_full_rescue_missing_tensor_rejects_despite_inventory(tmp_path: Path) -> None:
+    # Given: a full-rescue tree with one tensor deleted and a custody.json that still lists it.
+    paths = results(tmp_path)
+    root = paths[1].parent
+    files = {str(p.relative_to(root)): fsha(p) for p in root.rglob("*") if p.is_file()}
+    (root / "custody.json").write_text(json.dumps(files, sort_keys=True))
+    (root / "round-1/published/rank-0/state.safetensors").unlink()
+    # When / Then
+    with pytest.raises(Reject, match="custody_changed"):
+        driver.compare(paths, manifest())
 
 
 @pytest.mark.parametrize(
