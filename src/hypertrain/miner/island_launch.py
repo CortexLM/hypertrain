@@ -647,8 +647,14 @@ def launch_window(job: IslandJobV1, published: Path, leaf: int, *, timeout: floa
     n_gpus = job.manifest.training.reference_spec.layout.n_gpus
     outputs = [published / f"rank-{r}/windows/{leaf}.json" for r in range(n_gpus)]
     summary = load_json(confined(published, "rank-0/summary.json").read_bytes())
-    if not isinstance(summary, dict) or summary.get("backend") not in ("cpu", "cuda"):
-        raise IslandFailure("publication backend missing")
+    backend: Literal["cpu", "cuda"]
+    match summary.get("backend") if isinstance(summary, dict) else None:
+        case "cpu":
+            backend = "cpu"
+        case "cuda":
+            backend = "cuda"
+        case _:
+            raise IslandFailure("publication backend missing")
     ref = job.manifest.training.reference_spec
     env = dict(
         os.environ,
@@ -662,7 +668,7 @@ def launch_window(job: IslandJobV1, published: Path, leaf: int, *, timeout: floa
         if all(p.is_file() for p in outputs):
             return
         proc = subprocess.Popen(  # noqa: S603 - fixed interpreter/package, typed layout
-            launch_argv(job, published, summary["backend"]),
+            launch_argv(job, published, backend),
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

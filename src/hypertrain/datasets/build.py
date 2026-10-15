@@ -75,11 +75,12 @@ def parquet_loader(cache: Path) -> Loader:
             if p.suffix == ".zst":
                 import zstandard
 
-                raw = io.TextIOWrapper(zstandard.ZstdDecompressor().stream_reader(p.open("rb")))
+                zr = zstandard.ZstdDecompressor().stream_reader(p.open("rb"))
+                with io.TextIOWrapper(zr) as raw:
+                    yield from (json.loads(line) for line in raw if line.strip())
             else:
-                raw = io.TextIOWrapper(gzip.open(p, "rb"))
-            with raw:
-                yield from (json.loads(line) for line in raw if line.strip())
+                with gzip.open(p, "rt") as gz:
+                    yield from (json.loads(line) for line in gz if line.strip())
 
     return load
 
